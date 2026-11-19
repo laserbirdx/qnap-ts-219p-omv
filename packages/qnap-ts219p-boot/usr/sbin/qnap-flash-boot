@@ -1,0 +1,93 @@
+#!/bin/sh
+# qnap-flash-boot - build the 3M uImage (zImage + Kirkwood DTB) and 12M initramfs
+# for the QNAP TS-219P II and optionally write them to /dev/mtd1 and /dev/mtd2.
+#
+# Usage: qnap-flash-boot [--no-flash] [--mac XX:XX:XX:XX:XX:XX] [--root DIR] [KERNEL_VERSION]
+set -e
+
+TPL=/usr/share/qnap-ts219p-boot
+FLASH=1
+ROOT=""
+MAC_ARG=""
+KVER=""
+KERNEL_MAX=$((3 * 1024 * 1024))
+INITRD_MAX=$((12 * 1024 * 1024))
+
+[ -f /etc/default/qnap-ts219p-boot ] && . /etc/default/qnap-ts219p-boot
+KERNEL_PATTERN="${KERNEL_PATTERN:-6.1.*-marvell}"
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --no-flash) FLASH=0 ;;
+        --root) ROOT="$2"; shift ;;
+        --mac) MAC_ARG="$2"; shift ;;
+        *) KVER="$1" ;;
+    esac
+    shift
+done
+BOOT="$ROOT/boot"
+
+if [ -z "$KVER" ]; then
+    KVER=$(ls "$BOOT"/vmlinuz-* 2>/dev/null | sed 's#.*/vmlinuz-##' | while read -r v; do
+        case "$v" in $KERNEL_PATTERN) echo "$v" ;; esac; done | sort -V | tail -n1)
+fi
+[ -n "$KVER" ] || { echo "qnap-flash-boot: no kernel matching '$KERNEL_PATTERN' in $BOOT" >&2; exit 1; }
+
+K="$BOOT/vmlinuz-$KVER"
+I="$BOOT/initrd.img-$KVER"
+[ -f "$K" ] && [ -f "$I" ] || { echo "qnap-flash-boot: missing $K or $I" >&2; exit 1; }
+
+# Detect SoC variant (88F6282 vs 88F6281)
+DTB_NAME="kirkwood-ts219-6282.dtb"
+if grep -qi "88F6281" /proc/cpuinfo 2>/dev/null; then
+    DTB_NAME="kirkwood-ts219-6281.dtb"
+fi
+DTB_SRC="$ROOT/usr/lib/linux-image-$KVER/$DTB_NAME"
+[ -f "$DTB_SRC" ] || DTB_SRC="$TPL/$DTB_NAME"
+[ -f "$DTB_SRC" ] || { echo "qnap-flash-boot: DTB $DTB_NAME not found" >&2; exit 1; }
+
+# Determine eth0 MAC address so DTB always carries the real hardware MAC
+if [ -z "$MAC_ARG" ] && [ -r /sys/class/net/eth0/address ]; then
+    MAC_ARG=$(cat /sys/class/net/eth0/address)
+fi
+
+TMP=$(mktemp -d "${TMPDIR:-/var/tmp}/qnap-flash.XXXXXX")
+trap 'rm -rf "$TMP"' EXIT
+
+cp "$DTB_SRC" "$TMP/board.dtb"
+if [ -n "$MAC_ARG" ] && [ "$MAC_ARG" != "00:00:00:00:00:00" ]; then
+    # Convert 00:08:9b:11:22:33 -> 00 08 9b 11 22 33
+    MAC_BYTES=$(echo "$MAC_ARG" | tr ':' ' ' | tr 'A-F' 'a-f')
+    # shellcheck disable=SC2086
+    fdtput -t bx "$TMP/board.dtb" /ocp@f1000000/ethernet-controller@72000/ethernet0-port@0 local-mac-address $MAC_BYTES 2>/dev/null || true
+fi
+
+cat "$K" "$TMP/board.dtb" > "$TMP/zImage.dtb"
+mkimage -A arm -O linux -T kernel -C none -a 0x00008000 -e 0x00008000 \
+    -n "Debian-$KVER-TS219P" -d "$TMP/zImage.dtb" "$TMP/uImage" >/dev/null
+
+USIZE=$(stat -c %s "$TMP/uImage")
+ISIZE=$(stat -c %s "$I")
+[ "$USIZE" -le "$KERNEL_MAX" ] || { echo "qnap-flash-boot: uImage too large ($USIZE > $KERNEL_MAX)" >&2; exit 1; }
+[ "$ISIZE" -le "$INITRD_MAX" ] || { echo "qnap-flash-boot: initrd too large ($ISIZE > $INITRD_MAX)" >&2; exit 1; }
+
+cp "$TMP/uImage" "$BOOT/uImage.mtd1"
+cp "$I" "$BOOT/initrd.mtd2"
+echo "qnap-flash-boot: built uImage ($USIZE / $KERNEL_MAX bytes) & initrd ($ISIZE / $INITRD_MAX bytes) for $KVER"
+
+[ "$FLASH" = 1 ] || exit 0
+
+# Verify resized MTD layout is active before writing to /dev/mtd1 & /dev/mtd2
+MTD1_HEX=$(awk -F' ' '$1=="mtd1:" {print $2}' /proc/mtd 2>/dev/null || true)
+MTD2_HEX=$(awk -F' ' '$1=="mtd2:" {print $2}' /proc/mtd 2>/dev/null || true)
+if [ "$MTD1_HEX" != "00300000" ] || [ "$MTD2_HEX" != "00c00000" ]; then
+    echo "qnap-flash-boot: /proc/mtd is not using the 3M/12M layout (mtd1=$MTD1_HEX mtd2=$MTD2_HEX); skipping direct flash." >&2
+    exit 0
+fi
+
+# Pad to exact partition sizes or use flashcp directly (flashcp erases only needed blocks + verifies!)
+echo "qnap-flash-boot: flashing /dev/mtd1 (Kernel) and /dev/mtd2 (RootFS1)..."
+flashcp "$BOOT/uImage.mtd1" /dev/mtd1
+flashcp "$BOOT/initrd.mtd2" /dev/mtd2
+sync
+echo "qnap-flash-boot: SPI NOR flash updated and verified."

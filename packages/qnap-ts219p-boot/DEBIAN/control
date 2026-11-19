@@ -1,0 +1,16 @@
+Package: qnap-ts219p-boot
+Version: 1.0.0
+Architecture: armel
+Maintainer: laserbirdx <https://github.com/laserbirdx>
+Depends: initramfs-tools, mdadm, u-boot-tools, device-tree-compiler, e2fsprogs, util-linux, mtd-utils, qcontrol
+Section: admin
+Priority: optional
+Homepage: https://github.com/laserbirdx/qnap-ts-219p-omv
+Description: Boot support for Debian 12 + OMV 7 on the QNAP TS-219P II (Kirkwood 88F6282)
+ Boots Debian 12 (bookworm armel) from a loop-mounted root image (debian_omv.img)
+ on the existing QNAP RAID1 data volume (/dev/md0 -> /media/internal_1),
+ using the resized 3M Kernel + 12M RootFS1 SPI NOR flash layout:
+  - Kirkwood 88F6281 / 88F6282 device tree with MAC injection
+  - qnap-flash-boot builder & kernel postinst hook for /dev/mtd1 & /dev/mtd2
+  - custom initramfs /init assembling /dev/md0 and loop-mounting debian_omv.img
+  - PIC hardware watchdog handling and first-boot setup

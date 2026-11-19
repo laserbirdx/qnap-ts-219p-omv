@@ -1,0 +1,12 @@
+[Unit]
+Description=QNAP TS-219P II Boot Health Check & PIC Watchdog Disarm
+After=network-online.target ssh.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/qnap-boot-healthcheck
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,39 @@
+#!/bin/sh
+set -e
+
+SHARE=/usr/share/openmediavault-qnap-ts219p
+
+install_defaults() {
+    for f in qnap-fan.json qnap-led.json qnap-buttons.json; do
+        [ -f "/etc/$f" ] || cp "$SHARE/defaults/$f" "/etc/$f"
+    done
+}
+
+case "$1" in
+    configure)
+        install_defaults
+        # Ensure qcontrol --direct finds TS-219P II PIC16F profile
+        if [ -f /etc/qcontrol/ts219.lua ] && [ ! -e /etc/qcontrol.conf ]; then
+            ln -sf /etc/qcontrol/ts219.lua /etc/qcontrol.conf
+        fi
+        # Disable stock qcontrold daemon so it doesn't fight qnap-ts219p-hwd over /dev/ttyS1
+        systemctl disable --now qcontrold.service qcontrold.socket qcontrol.service >/dev/null 2>&1 || true
+        "$SHARE/webui-inject" || true
+        systemctl daemon-reload || true
+        systemctl enable qnap-ts219p-hwd.service >/dev/null 2>&1 || true
+        systemctl restart qnap-ts219p-hwd.service || true
+        if command -v omv-mkworkbench >/dev/null 2>&1; then
+            omv-mkworkbench all >/dev/null 2>&1 || true
+        fi
+        if command -v deb-systemd-invoke >/dev/null 2>&1; then
+            deb-systemd-invoke restart openmediavault-engined.service >/dev/null 2>&1 || true
+        else
+            systemctl restart openmediavault-engined.service >/dev/null 2>&1 || true
+        fi
+        ;;
+    triggered)
+        "$SHARE/webui-inject" || true
+        ;;
+esac
+
+exit 0

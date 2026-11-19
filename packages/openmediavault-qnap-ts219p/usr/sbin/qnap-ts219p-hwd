@@ -1,0 +1,571 @@
+#!/usr/bin/env python3
+"""
+qnap-ts219p-hwd - Hardware management daemon for QNAP TS-219P II on Debian 12 + OMV 7.
+
+Controls:
+  - PIC16F microcontroller via qcontrol (--direct) / /dev/ttyS1:
+      * Fan speed (stop / silence / low / medium / high / full) with smart thermal curve
+      * Status bi-color LED (greenon / redon / green1hz / red1hz / greenred1hz / off)
+      * Front USB blue LED (on / 8hz / off)
+      * Power LED & Buzzer feedback
+  - Chassis GPIO buttons (/dev/input/by-path/platform-gpio_keys-event or /dev/input/event0):
+      * Front USB One-Touch Copy button (KEY_COPY = 133 / 0x85)
+      * Rear Reset button (KEY_RESTART = 408 / 0x198)
+"""
+import json
+import os
+import re
+import glob
+import time
+import datetime
+import struct
+import subprocess
+import threading
+
+FAN_CONF = "/etc/qnap-fan.json"
+LED_CONF = "/etc/qnap-led.json"
+BTN_CONF = "/etc/qnap-buttons.json"
+STATE_FILE = "/run/qnap-ts219p-hwstate.json"
+
+KEY_NAMES = {
+    133: "USB Copy Button",
+    0x165: "USB Copy Button",
+    0x74: "Power Button",
+    408: "Reset Button",
+}
+
+FAN_LEVEL_MAP = {
+    0:    ("stop",    0,   0),
+    700:  ("silence", 700, 30),
+    950:  ("low",     950, 50),
+    1400: ("medium",  1400, 70),
+    1800: ("high",    1800, 85),
+    2200: ("full",    2200, 100),
+}
+
+
+def read_json(path, defaults):
+    try:
+        if os.path.exists(path):
+            with open(path, "r") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                res = dict(defaults)
+                res.update(data)
+                return res
+    except Exception:
+        pass
+    return dict(defaults)
+
+
+def write_json(path, data):
+    try:
+        with open(path, "w") as f:
+            json.dump(data, f, indent=4)
+    except Exception:
+        pass
+
+
+def piccmd(cmd, arg):
+    for qbin in ("/usr/sbin/qcontrol", "/sbin/qcontrol"):
+        if os.path.exists(qbin):
+            subprocess.run(
+                [qbin, "--direct", cmd, arg],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return
+
+
+def update_runtime_state(**kwargs):
+    st = read_json(STATE_FILE, {
+        "fan_name": "low",
+        "fan_rpm": 950,
+        "fan_pct": 50,
+        "cpu_temp": 40.0,
+        "status_led": "greenon",
+        "usb_led": "on",
+    })
+    st.update(kwargs)
+    write_json(STATE_FILE, st)
+
+
+def read_cpu_temp():
+    # Check Kirkwood SoC thermal zone / hwmon
+    for p in sorted(glob.glob("/sys/class/thermal/thermal_zone*/temp")) + sorted(
+        glob.glob("/sys/class/hwmon/hwmon*/temp1_input")
+    ):
+        try:
+            with open(p, "r") as f:
+                v = int(f.read().strip())
+                if v > 1000:
+                    return round(v / 1000.0, 1)
+                elif v > 0:
+                    return float(v)
+        except Exception:
+            pass
+    # Fallback: max HDD temperature if SoC thermal sensor reports 0
+    max_hdd = 38.0
+    for d in ("sda", "sdb"):
+        try:
+            r = subprocess.run(
+                ["/usr/sbin/smartctl", "-A", "-n", "standby", f"/dev/{d}"],
+                capture_output=True, text=True, timeout=3
+            )
+            for line in r.stdout.splitlines():
+                if "Temperature_Celsius" in line or "Airflow_Temperature_Cel" in line:
+                    cols = line.split()
+                    if len(cols) >= 10:
+                        max_hdd = max(max_hdd, float(cols[9]))
+                        break
+        except Exception:
+            pass
+    return max_hdd
+
+
+def get_btn_defaults():
+    return {
+        "long_press_sec": 2,
+        "led_feedback": True,
+        "buzzer_enabled": True,
+        "usb_backup_sharedfolderref": "",
+        "usb_backup_path": "",
+        "usb_backup_subdir": "USB_Backup",
+        "usb_backup_mode": "timestamp_folder",
+        "usb_backup_prefix": "USB_",
+        "usb_backup_timestamp_fmt": "YYYYMMDD_HHMMSS",
+        "usb_backup_suffix": "_Backup",
+        "usb_led_during": "blink_white_power",
+        "usb_led_complete": "flash_3x_restore",
+        "usb_post_action": "eject_usb",
+        "sync_short_action": "toggle_leds",
+        "sync_long_action": "usb_backup",
+        "power_short_action": "fan_boost_toggle",
+        "power_long_action": "poweroff",
+        "reset_short_action": "restart_smb",
+        "reset_long_action": "reset_network_dhcp",
+        "last_event": "None (Ready)",
+    }
+
+
+def record_button_event(msg):
+    cfg = read_json(BTN_CONF, get_btn_defaults())
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cfg["last_event"] = f"[{ts}] {msg}"
+    write_json(BTN_CONF, cfg)
+
+
+def is_in_off_schedule(cfg):
+    if not cfg.get("schedule_enabled", False):
+        return False
+    now_h = datetime.datetime.now().hour
+    start_h = int(cfg.get("off_start_hour", 23))
+    end_h = int(cfg.get("off_end_hour", 7))
+    if start_h == end_h:
+        return True
+    if start_h < end_h:
+        return start_h <= now_h < end_h
+    return (now_h >= start_h) or (now_h < end_h)
+
+
+def map_status_led_mode(w_mode, r_mode):
+    if r_mode in ("on", "solid"):
+        return "redon"
+    if r_mode in ("timer", "heartbeat", "disk-activity"):
+        return "red1hz" if w_mode == "off" else "greenred1hz"
+    if w_mode == "off":
+        return "off"
+    if w_mode in ("heartbeat", "timer", "disk-activity"):
+        return "green1hz"
+    return "greenon"
+
+
+def apply_leds_from_config():
+    cfg = read_json(LED_CONF, {
+        "preset_mode": "normal",
+        "led_white_power": "on",
+        "led_red_power": "off",
+        "led_white_sata": "disk-activity",
+        "led_red_sata": "off",
+        "schedule_enabled": False,
+        "off_start_hour": 23,
+        "off_end_hour": 7,
+        "sync_button_toggle": True,
+    })
+
+    preset = cfg.get("preset_mode", "normal")
+    if is_in_off_schedule(cfg) or preset in ("all_off", "night"):
+        piccmd("statusled", "off")
+        piccmd("usbled", "off")
+        piccmd("powerled", "off")
+        update_runtime_state(status_led="off", usb_led="off")
+        return
+
+    if preset == "normal":
+        piccmd("statusled", "greenon")
+        piccmd("usbled", "on")
+        piccmd("powerled", "on")
+        update_runtime_state(status_led="greenon", usb_led="on")
+    elif preset == "heartbeat_all":
+        piccmd("statusled", "green1hz")
+        piccmd("usbled", "8hz")
+        piccmd("powerled", "on")
+        update_runtime_state(status_led="green1hz", usb_led="8hz")
+    else:
+        st_mode = map_status_led_mode(
+            cfg.get("led_white_power", "on"),
+            cfg.get("led_red_power", "off")
+        )
+        usb_cfg = cfg.get("led_white_sata", "on")
+        usb_mode = "off" if usb_cfg == "off" else ("8hz" if usb_cfg in ("timer", "heartbeat") else "on")
+        piccmd("statusled", st_mode)
+        piccmd("usbled", usb_mode)
+        piccmd("powerled", "off" if st_mode == "off" else "on")
+        update_runtime_state(status_led=st_mode, usb_led=usb_mode)
+
+
+def apply_fan_from_config():
+    cfg = read_json(FAN_CONF, {
+        "mode": "auto",
+        "manual_rpm": 1400,
+        "temp_low": 40,
+        "temp_med": 48,
+        "temp_high": 56,
+    })
+    cpu_c = read_cpu_temp()
+    mode = cfg.get("mode", "auto")
+
+    if mode == "manual":
+        req_rpm = int(cfg.get("manual_rpm", 1400))
+        if req_rpm >= 2000:
+            key = 2200
+        elif req_rpm >= 1700:
+            key = 1800
+        elif req_rpm >= 1200:
+            key = 1400
+        elif req_rpm >= 800:
+            key = 950
+        elif req_rpm > 0:
+            key = 700
+        else:
+            key = 0
+    else:
+        if cpu_c >= float(cfg.get("temp_high", 56)):
+            key = 1800 if cpu_c < float(cfg.get("temp_high", 56)) + 6 else 2200
+        elif cpu_c >= float(cfg.get("temp_med", 48)):
+            key = 1400
+        elif cpu_c >= float(cfg.get("temp_low", 40)):
+            key = 950
+        else:
+            key = 700
+
+    fan_name, est_rpm, pct = FAN_LEVEL_MAP[key]
+    piccmd("fanspeed", fan_name)
+    update_runtime_state(fan_name=fan_name, fan_rpm=est_rpm, fan_pct=pct, cpu_temp=cpu_c)
+
+
+def blink_feedback(count=2):
+    bcfg = read_json(BTN_CONF, get_btn_defaults())
+    if bcfg.get("buzzer_enabled", True):
+        piccmd("buzzer", "short")
+    if not bcfg.get("led_feedback", True):
+        return
+    piccmd("usbled", "8hz")
+    time.sleep(0.4 * count)
+    apply_leds_from_config()
+
+
+def sanitize_rel_path(p):
+    cleaned = re.sub(r"[^a-zA-Z0-9_\-\./ ]", "", str(p or "").strip())
+    parts = [seg for seg in cleaned.replace("\\", "/").split("/") if seg and seg not in (".", "..")]
+    return "/".join(parts)
+
+
+def sanitize_token(s):
+    return re.sub(r"[^a-zA-Z0-9_\-\.]", "", str(s or "").strip())
+
+
+def safe_unmount_all_usb():
+    for blk in sorted(glob.glob("/sys/block/sd*")):
+        dev_name = os.path.basename(blk)
+        if dev_name in ("sda", "sdb"):
+            continue
+        for p in glob.glob(f"/dev/{dev_name}*"):
+            subprocess.run(["/bin/umount", "-l", p], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["/bin/sync"])
+
+
+def perform_usb_backup():
+    bcfg = read_json(BTN_CONF, get_btn_defaults())
+    share_root = str(bcfg.get("usb_backup_path", "") or "").strip()
+    subdir = sanitize_rel_path(bcfg.get("usb_backup_subdir", "USB_Backup"))
+    backup_mode = bcfg.get("usb_backup_mode", "timestamp_folder")
+    prefix = sanitize_token(bcfg.get("usb_backup_prefix", "USB_"))
+    ts_fmt = bcfg.get("usb_backup_timestamp_fmt", "YYYYMMDD_HHMMSS")
+    suffix = sanitize_token(bcfg.get("usb_backup_suffix", "_Backup"))
+    post_action = bcfg.get("usb_post_action", "eject_usb")
+
+    if not share_root or not os.path.isdir(share_root):
+        record_button_event("USB Backup Error: No destination shared folder configured")
+        piccmd("statusled", "red2hz")
+        time.sleep(1.5)
+        apply_leds_from_config()
+        return
+
+    dest_base = os.path.join(share_root, subdir) if subdir else share_root
+    os.makedirs(dest_base, exist_ok=True)
+
+    usb_parts = []
+    for blk in sorted(glob.glob("/sys/block/sd*")):
+        dev_name = os.path.basename(blk)
+        if dev_name in ("sda", "sdb"):
+            continue
+        subparts = sorted(glob.glob(f"/dev/{dev_name}[0-9]*"))
+        usb_parts.extend(subparts if subparts else [f"/dev/{dev_name}"])
+
+    if not usb_parts:
+        record_button_event("USB Backup Error: No USB drive connected")
+        piccmd("statusled", "red2hz")
+        time.sleep(1.5)
+        apply_leds_from_config()
+        return
+
+    piccmd("usbled", "8hz")
+    now = datetime.datetime.now()
+    ts_str = (
+        now.strftime("%Y%m%d_%H%M%S") if ts_fmt == "YYYYMMDD_HHMMSS"
+        else (now.strftime("%Y-%m-%d_%H-%M") if ts_fmt == "YYYY-MM-DD_HH-MM"
+              else (now.strftime("%Y-%m-%d") if ts_fmt == "YYYY-MM-DD" else ""))
+    )
+
+    copied_any = False
+    last_target_dir = dest_base
+    for part in usb_parts:
+        mnt_dir = f"/tmp/usb_backup_mnt_{os.path.basename(part)}"
+        os.makedirs(mnt_dir, exist_ok=True)
+        mounted_by_us = False
+        try:
+            proc = subprocess.run(["/bin/findmnt", "-n", "-o", "TARGET", part], capture_output=True, text=True)
+            cur_mnt = proc.stdout.strip()
+            if not cur_mnt:
+                r = subprocess.run(["/bin/mount", "-o", "ro", part, mnt_dir], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if r.returncode == 0:
+                    cur_mnt = mnt_dir
+                    mounted_by_us = True
+            if cur_mnt:
+                if backup_mode == "sync_overwrite":
+                    folder_name = f"{prefix}{suffix}".strip("_")
+                    target_dir = os.path.join(dest_base, folder_name) if folder_name else dest_base
+                else:
+                    folder_name = f"{prefix}{ts_str}{suffix}" or f"{os.path.basename(part)}_{now.strftime('%Y%m%d_%H%M%S')}"
+                    if len(usb_parts) > 1:
+                        folder_name = f"{folder_name}_{os.path.basename(part)}"
+                    target_dir = os.path.join(dest_base, folder_name)
+                os.makedirs(target_dir, exist_ok=True)
+                subprocess.run(["/bin/cp", "-a", f"{cur_mnt}/.", target_dir], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.run(["/bin/chmod", "-R", "777", target_dir], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                copied_any = True
+                last_target_dir = target_dir
+        finally:
+            if mounted_by_us:
+                subprocess.run(["/bin/umount", mnt_dir], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                os.rmdir(mnt_dir)
+            except Exception:
+                pass
+
+    subprocess.run(["/bin/sync"])
+    if not copied_any:
+        record_button_event("USB Backup Error: Could not mount/read USB filesystem")
+        piccmd("statusled", "red2hz")
+        time.sleep(1.5)
+        apply_leds_from_config()
+        return
+
+    if bcfg.get("buzzer_enabled", True):
+        piccmd("buzzer", "short")
+    apply_leds_from_config()
+
+    if post_action == "eject_usb":
+        safe_unmount_all_usb()
+        record_button_event(f"USB Backup OK -> {last_target_dir} (USB Safely Ejected)")
+    elif post_action == "keep_mounted":
+        record_button_event(f"USB Backup OK -> {last_target_dir} (USB Kept Mounted)")
+    elif post_action == "eject_and_leds_off":
+        safe_unmount_all_usb()
+        lcfg = read_json(LED_CONF, {"preset_mode": "all_off"})
+        lcfg["preset_mode"] = "all_off"
+        write_json(LED_CONF, lcfg)
+        apply_leds_from_config()
+        record_button_event(f"USB Backup OK -> {last_target_dir} (USB Ejected & LEDs OFF)")
+    elif post_action == "eject_and_poweroff":
+        safe_unmount_all_usb()
+        record_button_event(f"USB Backup OK -> {last_target_dir} (Shutting Down NAS)")
+        subprocess.Popen(["/bin/systemctl", "poweroff"])
+    elif post_action == "eject_and_reboot":
+        safe_unmount_all_usb()
+        record_button_event(f"USB Backup OK -> {last_target_dir} (Rebooting NAS)")
+        subprocess.Popen(["/bin/systemctl", "reboot"])
+
+
+def execute_button_action(btn_name, press_type, action_code):
+    if not action_code or action_code == "none":
+        record_button_event(f"{btn_name} ({press_type}): Disabled (No action)")
+        return
+    record_button_event(f"{btn_name} ({press_type}) -> {action_code}")
+
+    if action_code == "toggle_leds":
+        lcfg = read_json(LED_CONF, {"preset_mode": "normal"})
+        cur = lcfg.get("preset_mode", "normal")
+        lcfg["preset_mode"] = "normal" if cur in ("all_off", "night") else "all_off"
+        write_json(LED_CONF, lcfg)
+        apply_leds_from_config()
+        return
+
+    if action_code == "usb_backup":
+        perform_usb_backup()
+        return
+
+    blink_feedback(1 if press_type == "Short Press" else 2)
+
+    if action_code == "safe_eject_usb":
+        safe_unmount_all_usb()
+        record_button_event(f"{btn_name}: All USB drives safely unmounted")
+    elif action_code == "fan_boost_toggle":
+        fcfg = read_json(FAN_CONF, {"mode": "auto", "manual_rpm": 1800})
+        if fcfg.get("mode") == "manual" and int(fcfg.get("manual_rpm", 0)) >= 1800:
+            fcfg["mode"] = "auto"
+            record_button_event(f"{btn_name}: Fan switched to Automatic mode")
+        else:
+            fcfg["mode"] = "manual"
+            fcfg["manual_rpm"] = 2200
+            record_button_event(f"{btn_name}: Fan switched to Full Turbo mode")
+        write_json(FAN_CONF, fcfg)
+        apply_fan_from_config()
+    elif action_code == "restart_smb":
+        subprocess.run(["/bin/systemctl", "restart", "smbd", "wsdd-server"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        record_button_event(f"{btn_name}: SMB/CIFS service restarted")
+    elif action_code == "reset_network_dhcp":
+        subprocess.run(["/sbin/ip", "link", "set", "eth0", "up"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["/bin/systemctl", "restart", "systemd-networkd"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        record_button_event(f"{btn_name}: Network interface eth0 restarted")
+    elif action_code == "reboot":
+        subprocess.Popen(["/bin/systemctl", "reboot"])
+    elif action_code == "poweroff":
+        subprocess.Popen(["/bin/systemctl", "poweroff"])
+
+
+def find_gpio_keys_event():
+    for cand in (
+        "/dev/input/by-path/platform-gpio_keys-event",
+        "/dev/input/by-path/platform-gpio-keys-event",
+        "/dev/input/event0",
+    ):
+        if os.path.exists(cand):
+            return cand
+    return None
+
+
+def watch_chassis_buttons():
+    ev_path = find_gpio_keys_event()
+    if not ev_path:
+        return
+    press_times = {}
+    long_fired = {}
+
+    def check_long_hold(code, p_time):
+        bcfg = read_json(BTN_CONF, get_btn_defaults())
+        hold_target = max(1, int(bcfg.get("long_press_sec", 2)))
+        time.sleep(hold_target)
+        if press_times.get(code) == p_time and not long_fired.get(code, False):
+            long_fired[code] = True
+            btn_name = KEY_NAMES.get(code, f"Key {code}")
+            act_map = {
+                133: bcfg.get("sync_long_action", "usb_backup"),
+                0x165: bcfg.get("sync_long_action", "usb_backup"),
+                0x74: bcfg.get("power_long_action", "poweroff"),
+                408: bcfg.get("reset_long_action", "reset_network_dhcp"),
+            }
+            threading.Thread(
+                target=execute_button_action,
+                args=(btn_name, "Long Press", act_map.get(code, "none")),
+                daemon=True,
+            ).start()
+
+    try:
+        with open(ev_path, "rb") as f:
+            while True:
+                buf = f.read(16)
+                if not buf or len(buf) < 16:
+                    break
+                _, _, ev_type, code, value = struct.unpack("<IIHHi", buf)
+                if ev_type != 1 or code not in KEY_NAMES:
+                    continue
+                if value == 1:
+                    now_m = time.monotonic()
+                    press_times[code] = now_m
+                    long_fired[code] = False
+                    threading.Thread(target=check_long_hold, args=(code, now_m), daemon=True).start()
+                elif value == 0:
+                    p_time = press_times.pop(code, None)
+                    was_long = long_fired.pop(code, False)
+                    if p_time is not None and not was_long:
+                        bcfg = read_json(BTN_CONF, get_btn_defaults())
+                        btn_name = KEY_NAMES.get(code, f"Key {code}")
+                        act_map = {
+                            133: bcfg.get("sync_short_action", "toggle_leds"),
+                            0x165: bcfg.get("sync_short_action", "toggle_leds"),
+                            0x74: bcfg.get("power_short_action", "fan_boost_toggle"),
+                            408: bcfg.get("reset_short_action", "restart_smb"),
+                        }
+                        threading.Thread(
+                            target=execute_button_action,
+                            args=(btn_name, "Short Press", act_map.get(code, "none")),
+                            daemon=True,
+                        ).start()
+    except Exception:
+        pass
+
+
+if __name__ == "__main__":
+    import sys
+
+    # Always make sure PIC 5-min boot watchdog is disarmed
+    piccmd("watchdog", "off")
+
+    if "--once" in sys.argv:
+        apply_fan_from_config()
+        apply_leds_from_config()
+        sys.exit(0)
+    if "--leds-only" in sys.argv:
+        apply_leds_from_config()
+        sys.exit(0)
+    if "--usb-backup-now" in sys.argv:
+        perform_usb_backup()
+        sys.exit(0)
+
+    # Short ready beep on startup if enabled
+    bcfg = read_json(BTN_CONF, get_btn_defaults())
+    if bcfg.get("buzzer_enabled", True):
+        piccmd("buzzer", "short")
+
+    t = threading.Thread(target=watch_chassis_buttons, daemon=True)
+    t.start()
+
+    apply_fan_from_config()
+    apply_leds_from_config()
+    last_schedule_state = None
+    tick = 0
+    while True:
+        apply_fan_from_config()
+        if tick % 2 == 0:
+            try:
+                lcfg = read_json(LED_CONF, {})
+                cur_sched = is_in_off_schedule(lcfg)
+                if cur_sched != last_schedule_state:
+                    last_schedule_state = cur_sched
+                    apply_leds_from_config()
+            except Exception:
+                pass
+        tick += 1
+        time.sleep(10)

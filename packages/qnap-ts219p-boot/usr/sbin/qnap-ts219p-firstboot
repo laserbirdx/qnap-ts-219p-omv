@@ -1,0 +1,60 @@
+#!/bin/sh
+# qnap-ts219p-firstboot - one-time setup of a freshly installed image.
+# Runs before sshd. Triggered by /etc/qnap-ts219p/firstboot.
+set -u
+FLAG=/etc/qnap-ts219p/firstboot
+DATA=/media/internal_1
+INST="$DATA/.qnap-omv-install"
+IMG="$DATA/debian_omv.img"
+LOG="$DATA/qnap-omv-firstboot.log"
+
+log() { echo "[$(date '+%F %T')] $*" | tee -a "$LOG"; }
+[ -f "$FLAG" ] || exit 0
+log "first boot setup started"
+
+# 1. Fresh SSH host keys
+ssh-keygen -A >>"$LOG" 2>&1 && log "SSH host keys generated"
+
+# 2. Machine ID
+systemd-machine-id-setup >>"$LOG" 2>&1 || true
+
+# 3. Passwords chosen in the installer
+if [ -f "$INST/credentials" ]; then
+    if chpasswd < "$INST/credentials" 2>>"$LOG"; then
+        log "passwords applied for: $(cut -d: -f1 "$INST/credentials" | tr '\n' ' ')"
+        ADMINPW=$(grep '^admin:' "$INST/credentials" | cut -d: -f2-)
+        [ -n "$ADMINPW" ] && printf '%s\n%s\n' "$ADMINPW" "$ADMINPW" | smbpasswd -s -a admin >/dev/null 2>&1 || true
+    fi
+    shred -u "$INST/credentials" 2>/dev/null || rm -f "$INST/credentials"
+fi
+
+# 4. Grow the root image to the size requested in the installer (online)
+if [ -f "$INST/target_size_mb" ] && [ -f "$IMG" ]; then
+    WANT=$(cat "$INST/target_size_mb")
+    HAVE=$(( $(stat -c %s "$IMG") / 1048576 ))
+    if [ "$WANT" -gt "$HAVE" ] 2>/dev/null; then
+        truncate -s "${WANT}M" "$IMG" && losetup -c /dev/loop0 && resize2fs /dev/loop0 >>"$LOG" 2>&1 \
+            && log "root image grown ${HAVE}M -> ${WANT}M"
+    fi
+    rm -f "$INST/target_size_mb"
+fi
+
+# 5. Swap: configure QNAP RAID1 swap array (/dev/md2)
+SWAP=$(blkid -t TYPE=swap -o device 2>/dev/null | grep '^/dev/md' | head -n1)
+if [ -n "$SWAP" ]; then
+    UUID=$(blkid -s UUID -o value "$SWAP")
+    sed -i '/[[:space:]]swap[[:space:]]/d' /etc/fstab
+    echo "UUID=$UUID none swap sw,nofail 0 0" >> /etc/fstab
+    swapon -a 2>/dev/null || true
+    log "swap configured on $SWAP (UUID=$UUID)"
+fi
+
+# 6. Record only active RAID arrays (md0 + md2) so md9/md13 QTS partitions stay untouched
+if [ -x /usr/share/mdadm/mkconf ]; then
+    /usr/share/mdadm/mkconf > /etc/mdadm/mdadm.conf 2>/dev/null && log "mdadm.conf updated"
+fi
+
+rm -f "$FLAG"
+rmdir "$INST" 2>/dev/null || true
+log "first boot setup finished"
+exit 0

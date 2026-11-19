@@ -1,0 +1,19 @@
+# Build outputs & release assets (upload to GitHub Releases, never commit)
+dist/
+*.img
+*.img.gz
+*.tar.gz
+*.tgz
+*.bin
+SHA256SUMS*
+MD5SUMS*
+
+# Personal device SPI NOR flash dumps & resized MTD partitions (NEVER commit)
+backups/
+mtd-resized/
+stage1-test/
+
+# macOS / editor junk
+.DS_Store
+*.swp
+__pycache__/

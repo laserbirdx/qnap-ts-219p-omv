@@ -1,0 +1,43 @@
+#!/bin/sh
+# qnap-mtd-restore - restore original QNAP factory QTS SPI NOR flash from backup
+set -e
+
+BACKUP_DIR="${1:-/media/internal_1/qnap-mtd-backup}"
+[ "$(id -u)" = 0 ] || { echo "Run as root." >&2; exit 1; }
+
+for f in mtd1.kernel.backup mtd2.rootfs1.backup mtd3.rootfs2.backup mtd4.uboot-config.backup mtd5.nas-config.backup; do
+    [ -f "$BACKUP_DIR/$f" ] || { echo "Missing backup file: $BACKUP_DIR/$f" >&2; exit 1; }
+done
+
+if [ "$2" != "--yes" ]; then
+    echo "This will restore the original QNAP QTS 4.3.3 SPI NOR flash layout from:"
+    echo "  $BACKUP_DIR"
+    echo "Your data on /dev/md0 and debian_omv.img will NOT be deleted."
+    printf "Type YES to restore factory QTS flash: "
+    read -r ans
+    [ "$ans" = "YES" ] || { echo "Aborted."; exit 1; }
+fi
+
+TMP=$(mktemp -d /var/tmp/qnap-restore.XXXXXX)
+trap 'rm -rf "$TMP"' EXIT
+
+# Current resized layout maps:
+#   mtd5 = 0x0c0000..0x100000 (256K)
+#   mtd1 = 0x100000..0x400000 (3M = last 1M of old NAS Config + 2M old Kernel)
+#   mtd2 = 0x400000..0x1000000 (12M = 9M old RootFS1 + 3M old RootFS2)
+#   mtd4 = 0x080000..0x0c0000 (256K U-Boot Config)
+head -c 262144 "$BACKUP_DIR/mtd5.nas-config.backup" > "$TMP/new_mtd5.bin"
+tail -c +262145 "$BACKUP_DIR/mtd5.nas-config.backup" > "$TMP/new_mtd1.bin"
+cat "$BACKUP_DIR/mtd1.kernel.backup" >> "$TMP/new_mtd1.bin"
+cat "$BACKUP_DIR/mtd2.rootfs1.backup" "$BACKUP_DIR/mtd3.rootfs2.backup" > "$TMP/new_mtd2.bin"
+
+echo "==> Restoring NAS Config (head) to /dev/mtd5..."
+flashcp -v "$TMP/new_mtd5.bin" /dev/mtd5
+echo "==> Restoring NAS Config (tail) + Factory Kernel to /dev/mtd1..."
+flashcp -v "$TMP/new_mtd1.bin" /dev/mtd1
+echo "==> Restoring Factory RootFS1 + RootFS2 to /dev/mtd2..."
+flashcp -v "$TMP/new_mtd2.bin" /dev/mtd2
+echo "==> Restoring Factory U-Boot Config to /dev/mtd4..."
+flashcp -v "$BACKUP_DIR/mtd4.uboot-config.backup" /dev/mtd4
+sync
+echo "==> Factory QNAP QTS flash restored! Run 'reboot' to boot back into QTS."

@@ -1,0 +1,14 @@
+[Unit]
+Description=QNAP TS-219P II First-Boot Provisioning
+DefaultDependencies=no
+After=local-fs.target
+Before=ssh.service openmediavault-engined.service
+ConditionPathExists=/etc/qnap-ts219p/firstboot
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/qnap-ts219p-firstboot
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,3 @@
+# Configuration for qnap-ts219p-boot
+KERNEL_PATTERN="6.1.*-marvell"
+ROOT_IMAGE_NAME="debian_omv.img"

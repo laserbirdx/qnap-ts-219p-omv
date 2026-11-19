@@ -1,0 +1,244 @@
+#!/bin/sh
+
+export PATH=/sbin:/usr/sbin:/bin:/usr/bin
+
+[ -d /dev ] || mkdir -m 0755 /dev
+[ -d /root ] || mkdir -m 0700 /root
+[ -d /sys ] || mkdir /sys
+[ -d /proc ] || mkdir /proc
+[ -d /tmp ] || mkdir /tmp
+mkdir -p /var/lock
+mount -t sysfs -o nodev,noexec,nosuid sysfs /sys
+mount -t proc -o nodev,noexec,nosuid proc /proc
+
+# Immediate kernel panic auto-reboot (10 seconds)
+echo 10 > /proc/sys/kernel/panic 2>/dev/null || true
+echo 1 > /proc/sys/kernel/panic_on_oops 2>/dev/null || true
+
+mount -t devtmpfs -o nosuid,mode=0755 udev /dev
+
+[ ! -h /dev/fd ] && ln -s /proc/self/fd /dev/fd
+[ ! -h /dev/stdin ] && ln -s /proc/self/fd/0 /dev/stdin
+[ ! -h /dev/stdout ] && ln -s /proc/self/fd/1 /dev/stdout
+[ ! -h /dev/stderr ] && ln -s /proc/self/fd/2 /dev/stderr
+
+mkdir -p /dev/pts
+mount -t devpts -o noexec,nosuid,gid=5,mode=0620 devpts /dev/pts || true
+
+# Immediately disarm QNAP PIC 5-min hardware boot watchdog (/dev/ttyS1 @ 19200 -> 0x67)
+# U-Boot runs 'uart1 0x68' on every boot; sending 0x67 tells the PIC MCU the kernel is alive.
+if [ -x /usr/sbin/qcontrol ]; then
+	/usr/sbin/qcontrol --direct watchdog off 2>/dev/null || true
+elif [ -x /sbin/qcontrol ]; then
+	/sbin/qcontrol --direct watchdog off 2>/dev/null || true
+fi
+if [ -c /dev/ttyS1 ]; then
+	stty -F /dev/ttyS1 19200 cs8 -cstopb -parenb -ixon -ixoff raw 2>/dev/null || true
+	# 0x67 == octal \147 == ASCII 'g' (POSIX printf does not interpret \xHH!)
+	printf '\147' > /dev/ttyS1 2>/dev/null || true
+fi
+
+export DPKG_ARCH=
+[ -f /conf/arch.conf ] && . /conf/arch.conf
+export MODPROBE_OPTIONS="-qb"
+export ROOT=
+export ROOTDELAY=
+export ROOTFLAGS=
+export ROOTFSTYPE=
+export IP=
+export DEVICE=
+export BOOTIF=
+export UBIMTD=
+export break=
+export init=/sbin/init
+export quiet=n
+export readonly=n
+export rootmnt=/root
+export debug=
+export panic=10
+export blacklist=
+export resume=
+export resume_offset=
+export noresume=y
+export drop_caps=
+export fastboot=n
+export forcefsck=n
+export fsckfix=
+export BOOT=local
+
+for x in $(cat /proc/cmdline); do
+	case "$x" in
+		init=*) init="${x#init=}" ;;
+	esac
+done
+
+[ -f /conf/initramfs.conf ] && . /conf/initramfs.conf
+for conf in /conf/conf.d/*; do
+	[ -f "${conf}" ] && . "${conf}"
+done
+. /scripts/functions
+
+echo "Loading Debian 12 + OpenMediaVault 7 (QNAP TS-219P II Loop-Root Boot)..."
+
+mount -t tmpfs -o "nodev,noexec,nosuid,size=${RUNSIZE:-10%},mode=0755" tmpfs /run
+mkdir -m 0700 /run/initramfs
+
+log_begin_msg "Loading essential Kirkwood & storage drivers"
+for mod in \
+	orion_wdt softdog \
+	libphy fixed_phy of_mdio mdio_devres marvell mvmdio mv643xx_eth \
+	scsi_common scsi_mod libata sata_mv ahci libahci sd_mod \
+	md_mod raid1 loop \
+	crc16 crc32c_generic mbcache jbd2 ext4 \
+	xhci_hcd xhci_pci ehci_hcd ehci_orion usb_storage \
+	spi_orion spi_nor m25p80 cmdlinepart \
+	gpio_keys qnap_poweroff rtc_s35390a
+do
+	/sbin/modprobe "$mod" 2>/dev/null || true
+done
+load_modules 2>/dev/null || true
+log_end_msg
+
+run_scripts /scripts/init-top
+
+# Feed Orion hardware watchdog during initramfs assembly
+if [ -c /dev/watchdog ]; then
+	(
+		w_i=0
+		while [ $w_i -lt 40 ] && [ ! -f /run/initramfs/wdt.stop ]; do
+			echo 1
+			sleep 3
+			w_i=$((w_i + 1))
+		done
+		if [ -f /run/initramfs/wdt.stop ]; then
+			printf "V"
+		fi
+	) > /dev/watchdog 2>/dev/null &
+fi
+
+run_scripts /scripts/init-premount
+
+log_begin_msg "Waiting for SATA drives (sda3 / sdb3)"
+w=0
+while [ $w -lt 20 ]; do
+	[ -b /dev/sda3 ] || [ -b /dev/sdb3 ] && break
+	sleep 1
+	w=$((w + 1))
+done
+# Give second drive up to 5 extra seconds so RAID1 starts clean (2/2)
+w2=0
+while [ $w2 -lt 5 ]; do
+	[ -b /dev/sda3 ] && [ -b /dev/sdb3 ] && break
+	sleep 1
+	w2=$((w2 + 1))
+done
+log_end_msg
+
+log_begin_msg "Assembling QNAP data RAID1 (/dev/md0) & swap (/dev/md2)"
+if [ -b /dev/sda3 ] && [ -b /dev/sdb3 ]; then
+	/sbin/mdadm --assemble /dev/md0 /dev/sda3 /dev/sdb3 2>/dev/null || /sbin/mdadm --assemble --scan 2>/dev/null || true
+elif [ -b /dev/sda3 ] || [ -b /dev/sdb3 ]; then
+	/sbin/mdadm --assemble --run /dev/md0 /dev/sda3 /dev/sdb3 2>/dev/null || /sbin/mdadm --assemble --scan --run 2>/dev/null || true
+fi
+
+if [ -b /dev/sda2 ] && [ -b /dev/sdb2 ]; then
+	/sbin/mdadm --assemble /dev/md2 /dev/sda2 /dev/sdb2 2>/dev/null || true
+fi
+
+DATA_DEV=""
+w=0
+while [ $w -lt 20 ]; do
+	for cand in /dev/md0 /dev/md[0-9] /dev/md[0-9][0-9] /dev/md[0-9][0-9][0-9]; do
+		[ -b "$cand" ] || continue
+		bname="${cand#/dev/}"
+		sz=$(cat "/sys/block/${bname}/size" 2>/dev/null || echo 0)
+		# Data array is > 5 GiB (>= 8 digits in 512B sectors); QTS system arrays (md9/md13/md2) are ~512 MiB (6-7 digits)
+		[ "${#sz}" -ge 8 ] || continue
+		FST=$(/sbin/blkid -s TYPE -o value "$cand" 2>/dev/null || true)
+		if [ "$FST" = "ext4" ]; then
+			DATA_DEV="$cand"
+			break 2
+		fi
+	done
+	/sbin/mdadm --assemble /dev/md0 /dev/sda3 /dev/sdb3 2>/dev/null || true
+	sleep 1
+	w=$((w + 1))
+done
+log_end_msg
+
+if [ -z "$DATA_DEV" ]; then
+	panic "FATAL: QNAP data RAID1 array (/dev/md0) did not appear!"
+fi
+
+mkdir -p /host_md0
+if ! /bin/mount.util-linux -t ext4 -o rw,noatime "$DATA_DEV" /host_md0 2>/dev/null; then
+	if ! mount -t ext4 -o rw,noatime "$DATA_DEV" /host_md0; then
+		panic "FATAL: Could not mount $DATA_DEV on /host_md0!"
+	fi
+fi
+
+{
+	echo "=== QNAP TS-219P II Debian 12 Initramfs Log (uptime $(cat /proc/uptime 2>/dev/null || echo unknown)) ==="
+	echo "Kernel: $(uname -a)"
+	echo "Mounted $DATA_DEV on /host_md0"
+	cat /proc/mdstat 2>&1 || true
+	cat /proc/mtd 2>&1 || true
+} > /host_md0/debian_initramfs.log
+sync
+
+IMG_FILE="/host_md0/debian_omv.img"
+if [ ! -f "$IMG_FILE" ]; then
+	umount /host_md0 2>/dev/null || true
+	panic "FATAL: $IMG_FILE not found on data volume!"
+fi
+
+log_begin_msg "Mounting Debian 12 + OMV 7 root image ($IMG_FILE)"
+[ -b /dev/loop0 ] || mknod /dev/loop0 b 7 0 2>/dev/null || true
+/sbin/e2fsck -p "$IMG_FILE" >> /host_md0/debian_initramfs.log 2>&1 || true
+/sbin/losetup /dev/loop0 "$IMG_FILE" >> /host_md0/debian_initramfs.log 2>&1
+if ! /bin/mount.util-linux -t ext4 -o rw,noatime /dev/loop0 "${rootmnt}" 2>> /host_md0/debian_initramfs.log; then
+	if ! mount -t ext4 -o rw,noatime /dev/loop0 "${rootmnt}" 2>> /host_md0/debian_initramfs.log; then
+		sync
+		umount /host_md0 2>/dev/null || true
+		panic "FATAL: Failed to mount /dev/loop0!"
+	fi
+fi
+log_end_msg
+
+mkdir -p "${rootmnt}/media/internal_1"
+mount -n -o move /host_md0 "${rootmnt}/media/internal_1" || mount -n --move /host_md0 "${rootmnt}/media/internal_1"
+echo "Rootfs mounted and /host_md0 moved to ${rootmnt}/media/internal_1" >> "${rootmnt}/media/internal_1/debian_initramfs.log"
+sync
+
+# Ensure first-boot provisioning runs even if systemd preset-all reset wants/ on empty machine-id
+if [ -f "${rootmnt}/etc/qnap-ts219p/firstboot" ] && [ -f "${rootmnt}/lib/systemd/system/qnap-ts219p-firstboot.service" ]; then
+	mkdir -p "${rootmnt}/etc/systemd/system/multi-user.target.wants"
+	ln -sf /lib/systemd/system/qnap-ts219p-firstboot.service "${rootmnt}/etc/systemd/system/multi-user.target.wants/qnap-ts219p-firstboot.service"
+fi
+
+run_scripts /scripts/init-bottom
+
+# Cleanly release initramfs watchdog feeder so systemd can take over /dev/watchdog
+: > /run/initramfs/wdt.stop
+sleep 4
+
+mount -n -o move /run "${rootmnt}/run" || mount -n --move /run "${rootmnt}/run"
+
+validate_init() {
+	run-init -n "${rootmnt}" "${1}"
+}
+
+if ! validate_init "$init"; then
+	for inittest in /sbin/init /etc/init /bin/init /bin/sh; do
+		if validate_init "${inittest}"; then
+			init="$inittest"
+			break
+		fi
+	done
+fi
+
+mount -n -o move /sys "${rootmnt}/sys" || mount -n --move /sys "${rootmnt}/sys"
+mount -n -o move /proc "${rootmnt}/proc" || mount -n --move /proc "${rootmnt}/proc"
+
+exec run-init "${rootmnt}" "${init}" "$@" <"${rootmnt}/dev/console" >"${rootmnt}/dev/console" 2>&1
+panic "Something went badly wrong in the initramfs."

@@ -1,0 +1,39 @@
+#!/bin/sh
+# qnap-boot-healthcheck - confirms boot, disarms PIC boot watchdog, sets LED green & beeps once.
+set -u
+LOG=/var/log/qnap-boot-healthcheck.log
+IFACE=eth0
+TIMEOUT=90
+
+log() { echo "[$(date '+%F %T')] $*" | tee -a "$LOG"; }
+
+# Ensure QNAP PIC 5-min boot watchdog is disarmed
+if [ -x /usr/sbin/qcontrol ]; then
+    /usr/sbin/qcontrol --direct watchdog off 2>/dev/null || true
+fi
+if [ -c /dev/ttyS1 ]; then
+    stty -F /dev/ttyS1 19200 cs8 -cstopb -parenb -ixon -ixoff raw 2>/dev/null || true
+    printf '\x67' > /dev/ttyS1 2>/dev/null || true
+fi
+
+log "Debian 12 + OMV 7 booted on QNAP TS-219P II: $(uname -r)"
+ok=0
+i=0
+while [ "$i" -lt "$TIMEOUT" ]; do
+    if ip -4 addr show dev "$IFACE" 2>/dev/null | grep -q "inet " && systemctl is-active --quiet ssh; then
+        ok=1
+        break
+    fi
+    systemctl is-active --quiet ssh || systemctl start ssh 2>/dev/null || true
+    sleep 2
+    i=$((i + 2))
+done
+
+if [ "$ok" = 1 ]; then
+    IP=$(ip -4 -o addr show dev "$IFACE" | awk '{print $4}')
+    log "HEALTHCHECK PASSED: $IFACE=$IP, sshd active"
+    exit 0
+fi
+
+log "WARNING: $IFACE had no IPv4 after ${TIMEOUT}s"
+exit 0

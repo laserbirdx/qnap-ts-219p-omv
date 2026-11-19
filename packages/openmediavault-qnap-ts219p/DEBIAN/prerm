@@ -1,0 +1,11 @@
+#!/bin/sh
+set -e
+SHARE=/usr/share/openmediavault-qnap-ts219p
+case "$1" in
+    remove|deconfigure)
+        systemctl stop qnap-ts219p-hwd.service >/dev/null 2>&1 || true
+        systemctl disable qnap-ts219p-hwd.service >/dev/null 2>&1 || true
+        [ -x "$SHARE/webui-inject" ] && "$SHARE/webui-inject" --remove || true
+        ;;
+esac
+exit 0

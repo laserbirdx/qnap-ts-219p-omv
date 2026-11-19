@@ -1,0 +1,23 @@
+#!/bin/sh
+set -e
+
+INDEX=/var/www/openmediavault/index.html
+[ -f "$INDEX" ] || exit 0
+
+VER=$(dpkg-query -W -f='${Version}' openmediavault-qnap-ts219p 2>/dev/null || echo 1)
+
+STYLE=$(ls /var/www/openmediavault/styles.*.css 2>/dev/null | head -n1 | xargs -r basename || true)
+if [ -n "$STYLE" ] && ! grep -q "$STYLE" "$INDEX"; then
+    sed -i "s#</head>#<link rel=\"stylesheet\" href=\"$STYLE\">\n</head>#" "$INDEX"
+fi
+
+sed -i 's#<link [^>]*qnap-chassis\.css[^>]*>##g' "$INDEX"
+sed -i 's#<script [^>]*qnap-chassis\.js[^>]*></script>##g' "$INDEX"
+
+if [ "$1" = "--remove" ]; then
+    exit 0
+fi
+
+TAG="<link rel=\"stylesheet\" href=\"assets/qnap-chassis.css?v=${VER}\"><script src=\"assets/qnap-chassis.js?v=${VER}\" defer></script>"
+sed -i "s#</head>#${TAG}\n</head>#" "$INDEX"
+exit 0

@@ -1,0 +1,12 @@
+[Unit]
+Description=QNAP TS-219P II Hardware Control Daemon (PIC Fan, LEDs, Buzzer & Buttons)
+After=local-fs.target systemd-udev-settle.service
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/qnap-ts219p-hwd
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

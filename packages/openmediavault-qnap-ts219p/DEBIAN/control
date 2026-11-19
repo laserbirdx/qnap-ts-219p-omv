@@ -1,0 +1,17 @@
+Package: openmediavault-qnap-ts219p
+Version: 1.0.0
+Architecture: all
+Maintainer: laserbirdx <https://github.com/laserbirdx>
+Depends: openmediavault (>= 7.0), python3, qcontrol, smartmontools, ethtool
+Recommends: qnap-ts219p-boot
+Section: admin
+Priority: optional
+Homepage: https://github.com/laserbirdx/qnap-ts-219p-omv
+Description: OpenMediaVault 7 hardware plugins for the QNAP TS-219P II (Kirkwood 88F6282)
+ Native OMV 7 plugins for the QNAP TS-219P II (Marvell Kirkwood 88F6282):
+  - Fan & Thermal: PIC16F smart fan curve & manual control (silence/low/med/high/full)
+  - LED & Night Mode: Status bi-color LED, USB LED, presets, hourly sleep schedule
+  - Chassis Buttons: short/long press actions for Front USB Copy and Rear Reset
+  - One-Touch USB Backup with folder naming, buzzer/LED feedback and post-actions
+  - Interactive "Hardware Overview" dashboard widget (front/rear chassis)
+ English and Turkish (tr_TR) translations included.

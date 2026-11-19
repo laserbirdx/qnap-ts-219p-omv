@@ -1,0 +1,48 @@
+#!/bin/sh
+# initramfs-tools hook for the QNAP TS-219P II loop-root boot.
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+case $1 in
+    prereqs) prereqs; exit 0 ;;
+esac
+
+. /usr/share/initramfs-tools/hook-functions
+
+TPL=/usr/share/qnap-ts219p-boot
+
+# Overwrite /init with our loop-root + PIC watchdog disarmer script
+cp "$TPL/init" "${DESTDIR}/init"
+chmod 0755 "${DESTDIR}/init"
+
+mkdir -p "${DESTDIR}/etc/mdadm"
+[ -f /etc/mdadm/mdadm.conf ] && cp /etc/mdadm/mdadm.conf "${DESTDIR}/etc/mdadm/mdadm.conf"
+
+copy_exec /sbin/losetup /sbin/losetup
+copy_exec /sbin/mdadm /sbin/mdadm
+copy_exec /sbin/blkid /sbin/blkid
+copy_exec /sbin/e2fsck /sbin/e2fsck
+copy_exec /bin/mount /bin/mount.util-linux
+[ -x /bin/stty ] && copy_exec /bin/stty /bin/stty
+[ -x /usr/bin/stty ] && copy_exec /usr/bin/stty /bin/stty
+[ -x /usr/sbin/qcontrol ] && copy_exec /usr/sbin/qcontrol /usr/sbin/qcontrol
+
+for m in \
+    orion_wdt softdog \
+    libphy fixed_phy of_mdio mdio_devres marvell mvmdio mv643xx_eth \
+    scsi_common scsi_mod libata sata_mv ahci libahci sd_mod \
+    md_mod raid1 loop \
+    crc16 crc32c_generic mbcache jbd2 ext2 ext3 ext4 \
+    xhci_hcd xhci_pci ehci_hcd ehci_orion usb_storage \
+    spi_orion spi_nor m25p80 cmdlinepart \
+    gpio_keys qnap_poweroff rtc_s35390a
+do
+    manual_add_modules "$m" 2>/dev/null || true
+done
+
+# Strip bulky unused subsystems so initrd stays ~4.5 MB (well inside 12 MB RootFS1)
+rm -rf "${DESTDIR}"/usr/lib/modules/*/kernel/drivers/gpu \
+       "${DESTDIR}"/usr/lib/modules/*/kernel/drivers/media \
+       "${DESTDIR}"/usr/lib/modules/*/kernel/drivers/net/wireless \
+       "${DESTDIR}"/usr/lib/modules/*/kernel/drivers/infiniband \
+       "${DESTDIR}"/usr/lib/modules/*/kernel/drivers/staging \
+       "${DESTDIR}"/usr/lib/modules/*/kernel/sound 2>/dev/null || true

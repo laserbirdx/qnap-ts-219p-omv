@@ -1,0 +1,12 @@
+#!/bin/sh
+# Rebuild and flash QNAP TS-219P II uImage + initrd after kernel updates.
+set -e
+KVER="$1"
+[ -f /etc/default/qnap-ts219p-boot ] && . /etc/default/qnap-ts219p-boot
+KERNEL_PATTERN="${KERNEL_PATTERN:-6.1.*-marvell}"
+case "$KVER" in
+    $KERNEL_PATTERN) ;;
+    *) exit 0 ;;
+esac
+[ "${QNAP_SKIP_FLASH:-0}" = 1 ] && exit 0
+exec /usr/sbin/qnap-flash-boot "$KVER"
