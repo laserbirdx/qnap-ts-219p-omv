@@ -7,8 +7,8 @@ data:
   permissions:
     role:
       - admin
-  title: _("Seagate Fan, Thermal & LED (Table)")
-  description: _("Displays Seagate NAS fan speed, thermal sensors and LED status in a table.")
+  title: _("QNAP Fan, Thermal & LED (Table)")
+  description: _("Displays QNAP TS-219P II fan speed, thermal sensors and LED status in a table.")
   datatable:
     columns:
       - name: _("Sensor / Component")

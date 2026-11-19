@@ -200,6 +200,13 @@ Assign custom short-press and long-press actions to the **Front USB Copy** butto
   <img src="assets/plugin_buttons.png" alt="QNAP TS-219P II Chassis Buttons and One-Touch USB Copy Plugin" width="100%">
 </p>
 
+### 5. RAID Resync & Speed Control (Service + Dashboard Widget)
+Monitor live RAID 1 resync progress, speed, ETA, and write-intent bitmap status directly from the OMV Dashboard (`RAID Resync & Health` widget), throttle background resync bandwidth (`Min / Max MB/s`, persisted across reboots), pause/resume resync (`frozen` / `idle`), and enable the internal write-intent bitmap with one click.
+
+<p align="center">
+  <img src="assets/plugin_raid.png" alt="QNAP TS-219P II RAID Resync and Speed Control Plugin" width="100%">
+</p>
+
 ---
 
 ## Building from source
